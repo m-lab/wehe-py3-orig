@@ -39,6 +39,8 @@ To kill the server:
 
 import gevent.monkey
 import time
+import tracemalloc
+import linecache
 
 gevent.monkey.patch_all()
 from multiprocessing_logging import install_mp_handler
@@ -84,6 +86,30 @@ def timeout(time):
         signal.signal(signal.SIGALRM, signal.SIG_IGN)
 
 
+def display_top(snapshot, key_type='lineno', limit=10):
+    snapshot = snapshot.filter_traces((
+        tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+        tracemalloc.Filter(False, "<unknown>"),
+    ))
+    top_stats = snapshot.statistics(key_type)
+
+    print("Top %s lines" % limit)
+    for index, stat in enumerate(top_stats[:limit], 1):
+        frame = stat.traceback[0]
+        print("#%s: %s:%s: %.1f KiB"
+              % (index, frame.filename, frame.lineno, stat.size / 1024))
+        line = linecache.getline(frame.filename, frame.lineno).strip()
+        if line:
+            print('    %s' % line)
+
+    other = top_stats[limit:]
+    if other:
+        size = sum(stat.size for stat in other)
+        print("%s other: %.1f KiB" % (len(other), size / 1024))
+    total = sum(stat.size for stat in top_stats)
+    print("Total allocated size: %.1f KiB" % (total / 1024))
+
+
 def raise_timeout(signum, frame):
     raise Exception("Timeout")
 
@@ -99,6 +125,27 @@ def get_anonymizedIP(ip):
         anonymizedIP = ip
 
     return anonymizedIP
+
+
+def get_size(obj, seen=None):
+    """Recursively finds size of objects"""
+    size = sys.getsizeof(obj)
+    if seen is None:
+        seen = set()
+    obj_id = id(obj)
+    if obj_id in seen:
+        return 0
+    # Important mark as seen *before* entering recursion to gracefully handle
+    # self-referential objects
+    seen.add(obj_id)
+    if isinstance(obj, dict):
+        size += sum([get_size(v, seen) for v in obj.values()])
+        size += sum([get_size(k, seen) for k in obj.keys()])
+    elif hasattr(obj, '__dict__'):
+        size += get_size(obj.__dict__, seen)
+    elif hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes, bytearray)):
+        size += sum([get_size(i, seen) for i in obj])
+    return size
 
 
 class TestObject(object):
@@ -175,7 +222,8 @@ class ClientObj(object):
         if Configs().get('tcpdumpInt') == "default":
             self.dump = tcpdump(dump_name=dumpName, targetFolder=self.tcpdumpsFolder)
         else:
-            self.dump = tcpdump(dump_name=dumpName, targetFolder=self.tcpdumpsFolder, interface=Configs().get('tcpdumpInt'))
+            self.dump = tcpdump(dump_name=dumpName, targetFolder=self.tcpdumpsFolder,
+                                interface=Configs().get('tcpdumpInt'))
 
     def create_info_json(self, infoFile):
         # To protect user privacy
@@ -427,7 +475,6 @@ class TCPServer(object):
             # Once the request is fully received, send the response
 
             time_origin = time.time()
-            # TODO WHAT HAPPENS WHEN SENDING RESPONSE BACK?
 
             for response in response_set.response_list:
                 if pCount == smpacNum:
@@ -516,7 +563,6 @@ class UDPServer(object):
             try:
                 if id in self.all_clients:
                     idExists = True
-                    # all_clients[id]'s only key is the replayName for this client
                     replayName = list(self.all_clients[id].keys())[0]
                 else:
                     idExists = False
@@ -544,15 +590,13 @@ class UDPServer(object):
         '''
         Sends a queue of UDP packets to client socket
         '''
+        udp_test_timeout = 45
         # 1-Register greenlet
         self.greenlets_q.put((gevent.getcurrent(), id, replayName, 'udp', str(self.instance)))
         clientPort = str(client_address[1]).zfill(5)
 
         # 2-Let client know the start of new send_Q
         self.notify_q.put((id, replayName, clientPort, 'STARTED'))
-
-        # TODO check whether UDP Server Side changes need to be made on this replay
-        # If so, get which packet number it is
 
         # 3- Start sending
         for udp_set in Q:
@@ -561,6 +605,10 @@ class UDPServer(object):
 
             with self.send_lock:
                 self.server.socket.sendto(bytes.fromhex(udp_set.payload), client_address)
+
+            time_progress = time.time() - time_origin
+            if time_progress > udp_test_timeout:
+                break
 
             if DEBUG == 2: print('\tsent:', udp_set.payload, 'to', client_address)
             if DEBUG == 3: print('\tsent:', len(udp_set.payload), 'to', client_address)
@@ -591,8 +639,13 @@ class SideChannel(object):
                        SideChannel puts start and stop on this queue to tell when to start/stop tcpdump process
     '''
 
-    def __init__(self, instance, udpSenderCounts, notify_q, greenlets_q, ports_q, logger_q, errorlog_q, buff_size=4096):
+    def __init__(self, instance, Qs, LUT, getLUT, allUDPservers, udpSenderCounts, notify_q, greenlets_q, ports_q,
+                 logger_q, errorlog_q, buff_size=4096):
         self.instance = instance
+        self.Qs = Qs
+        self.LUT = LUT
+        self.getLUT = getLUT
+        self.allUDPservers = allUDPservers
         self.udpSenderCounts = udpSenderCounts
         self.notify_q = notify_q
         self.greenlets_q = greenlets_q
@@ -608,6 +661,7 @@ class SideChannel(object):
         self.max_time = 5 * 60
         self.admissionCtrl = {}  # self.admissionCtrl[id][replayName] = testObj
         self.inProgress = {}  # self.inProgress[realID] = (id, replayName)
+        self.replays_since_last_cleaning = []  # replays used since last cleaning
         if Configs().get('EC2'):
             self.instanceID = self.getEC2instanceID()
         else:
@@ -628,6 +682,7 @@ class SideChannel(object):
         self.mappings = mappings  # [mapping, ...] where each mapping belongs to one UDPServer
 
         gevent.Greenlet.spawn(self.notify_clients)
+        # gevent.Greenlet.spawn(self.replay_cleaner)
         gevent.Greenlet.spawn(self.add_greenlets)
         gevent.Greenlet.spawn(self.greenlet_cleaner)
         gevent.Greenlet.spawn(self.replay_logger, Configs().get('replayLog'))
@@ -727,16 +782,6 @@ class SideChannel(object):
             realIP = clientIP
             clientVersion = '1.0'
 
-        # Fix cases where the replayName are not in correct format
-        if replayName == 'AmazonAug8':
-            replayName = 'Amazon-Aug8'
-        elif replayName == 'AmazonAug8Random':
-            replayName = 'AmazonRandom-Aug8'
-        elif replayName == 'NetflixSep22':
-            replayName = 'Netflix-Sep22'
-        elif replayName == 'NetflixSep22Random':
-            replayName = 'NetflixRandom-Sep22'
-
         if extraString == '':
             extraString = 'extraString'
 
@@ -768,13 +813,14 @@ class SideChannel(object):
         self.killIfNeeded(realID)
 
         # 2b- if unknown replayName
-        if replayName not in self.udpSenderCounts:
-            LOG_ACTION(logger, '*** Unknown replay name: {} ({}) ***'.format(replayName, realID))
-            send_result = self.send_object(connection, '0;1')
-            dClient.exceptions = 'UnknownRelplayName'
-            # self.logger_q.put('\t'.join(dClient.get_info()))
-            REPLAY_ERROR_COUNT.labels('unknown_name').inc()
-            return
+        if (replayName not in self.Qs["tcp"]) and (replayName not in self.Qs["udp"]):
+            if not load_replay(replayName, self.Qs, self.LUT, self.getLUT, self.allUDPservers, self.udpSenderCounts):
+                LOG_ACTION(logger, '*** Unknown replay name: {} ({}) ***'.format(replayName, realID))
+                send_result = self.send_object(connection, '0;1')
+                dClient.exceptions = 'UnknownRelplayName'
+                # self.logger_q.put('\t'.join(dClient.get_info()))
+                REPLAY_ERROR_COUNT.labels('unknown_name').inc()
+                return
         # 2c- if server is overloaded
         cpuPercent, memPercent, diskPercent, upLoad = getSystemStat()
 
@@ -1009,7 +1055,8 @@ class SideChannel(object):
             LOG_ACTION(logger, '\nSomething weird happened! Result\n', indent=2, action=False)
             return
 
-        LOG_ACTION(logger, 'Received DATA: {}, endOfTest {}, testID {}'.format(data, endOfTest, testID), indent=2, action=False)
+        LOG_ACTION(logger, 'Received DATA: {}, endOfTest {}, testID {}'.format(data, endOfTest, testID), indent=2,
+                   action=False)
 
         if data[1] == 'Yes':
             if self.send_reults(connection) is False: return
@@ -1024,8 +1071,10 @@ class SideChannel(object):
 
         REPLAY_COUNT.labels(replayName).inc()
 
-        # 9- Set secondarySuccess to True and close connection
+        # 9- Set secondarySuccess to True, add this replay to recent list, and close connection
         dClient.secondarySuccess = True
+        if replayName not in self.replays_since_last_cleaning:
+            self.replays_since_last_cleaning.append(replayName)
 
         folder = resultsFolder + '/replayInfo/'
         replayInfoFile = folder + 'replayInfo_{}_{}_{}.json'.format(realID, historyCount, testID)
@@ -1191,11 +1240,9 @@ class SideChannel(object):
                     pass
 
         # Clean dicts
-        # print '\r\n CLEANING DICTS', self.all_clients[id][replayName], self.all_side_conns[g], self.id2g[ dClient.realID ]
         del self.all_clients[id][replayName]
         del self.all_side_conns[g]
         del self.id2g[dClient.realID]
-        # del self.all_clients[id]
 
         print("SecondarySuccess, exceptions", dClient.secondarySuccess, dClient.exceptions)
 
@@ -1203,8 +1250,9 @@ class SideChannel(object):
         if dClient.secondarySuccess:
             tcpdumpstarts = time.time()
             if dClient.exceptions != 'ContentModification':
-                permResultsFolder = getCurrentResultsFolder() + "/{}/tcpdumpsResults/".format(dClient.realID)
-                clean_pcap(dClient.dump.dump_name, dClient.id, get_anonymizedIP(dClient.id), dClient.ports, permResultsFolder)
+                permResultsFolder = getCurrentResultsFolder()
+                clean_pcap(dClient.dump.dump_name, dClient.id, get_anonymizedIP(dClient.id), dClient.ports,
+                           dClient.realID, permResultsFolder)
                 tcpdumpends = time.time()
                 cpuPercent, memPercent, diskPercent, upLoad = getSystemStat()
                 LOG_ACTION(logger,
@@ -1214,7 +1262,7 @@ class SideChannel(object):
                            action=False)
             # recursively change the dClient results' ownership from root to user
             # makes it easier to delete after data is backed up
-            if os.getenv("SUDO_UID") :
+            if os.getenv("SUDO_UID"):
                 uid = int(os.getenv("SUDO_UID"))
                 for root, dirs, files in os.walk(dClient.targetFolder):
                     for dir in dirs:
@@ -1250,12 +1298,6 @@ class SideChannel(object):
             toWrite = str(toWrite)
 
             print('\n***CHECK ERROR LOGS: {}***'.format(toWrite))
-
-            #             try:
-            #                 self.all_clients[id].exceptions = 'WithExp'
-            #                 toWrite = '\t'.join(self.all_clients[id].get_info())
-            #             except:
-            #                 toWrite = id + '\tNoSuchClient'
 
             errorLogger.info(toWrite)
 
@@ -1295,6 +1337,38 @@ class SideChannel(object):
                     self.errorlog_q.put(
                         (get_anonymizedIP(clientIP), replayName, 'Unknown connection', who.upper(), instance))
 
+    def replay_cleaner(self):
+        '''
+        This goes through self.Qs and delete replays that are not used since last cleaning
+        '''
+        while True:
+            udp_replays_to_delete = []
+            tcp_replays_to_delete = []
+
+            for replayName in self.Qs["udp"]:
+                if replayName not in self.replays_since_last_cleaning:
+                    udp_replays_to_delete.append(replayName)
+
+            for replayName in self.Qs["tcp"]:
+                if replayName not in self.replays_since_last_cleaning:
+                    tcp_replays_to_delete.append(replayName)
+
+            LOG_ACTION(logger, "Cleaning not used replays, current total {}, to delete {}".format(
+                len(self.Qs["tcp"]), udp_replays_to_delete + tcp_replays_to_delete))
+
+            # clean TCP
+            for key in tcp_replays_to_delete:
+                del self.Qs["tcp"][key]
+            # clean UDP
+            for key in udp_replays_to_delete:
+                del self.Qs["udp"][key]
+
+            self.replays_since_last_cleaning = []
+            LOG_ACTION(logger, 'Done cleaning: remaining total {}, remaining replays {}, Qs size {}'.format(len(self.Qs["tcp"]), self.Qs["tcp"].keys(), get_size(self.Qs)), indent=1, action=False)
+            snapshot = tracemalloc.take_snapshot()
+            display_top(snapshot)
+            gevent.sleep(self.sleep_time)
+
     def greenlet_cleaner(self):
         '''
         This goes through self.greenlets and kills any greenlet which is 
@@ -1302,8 +1376,9 @@ class SideChannel(object):
         '''
         while True:
             LOG_ACTION(logger, 'Cleaning dangling greenlets: {}'.format(len(self.greenlets)))
+            ip_need_cleaning = []
             for ip in self.greenlets:
-
+                replay_in_progress_this_ip = False
                 for replayName in list(self.greenlets[ip].keys()):
 
                     for g in list(self.greenlets[ip][replayName].keys()):
@@ -1317,6 +1392,14 @@ class SideChannel(object):
 
                     if len(self.greenlets[ip][replayName]) == 0:
                         del self.greenlets[ip][replayName]
+                    else:
+                        replay_in_progress_this_ip = True
+
+                if not replay_in_progress_this_ip:
+                    ip_need_cleaning.append(ip)
+
+            for ip in ip_need_cleaning:
+                del self.greenlets[ip]
 
             LOG_ACTION(logger, 'Done cleaning: {}'.format(len(self.greenlets)), indent=1, action=False)
             gevent.sleep(self.sleep_time)
@@ -1570,7 +1653,110 @@ def merge_servers(Q):
     return newQ, senderCount
 
 
-def load_Qs(serialize='pickle'):
+def load_replay(replayName, Qs, LUT, getLUT, allUDPservers, udpSenderCounts):
+    replayName = replayName.replace("-", "_")
+    replay_file_dirs = replayName_to_replay_file_folders(replayName)
+    new_replay_LUT = {}
+    new_replay_getLUT = {}
+    allIPs = set()
+    tcpIPs = {}
+
+    try:
+        for replay_file_dir in replay_file_dirs:
+            load_server_replay(replay_file_dir, Qs, new_replay_LUT, new_replay_getLUT, allUDPservers, udpSenderCounts,
+                               serialize='pickle')
+            update_Qs(LUT, getLUT, allIPs, tcpIPs, Qs, new_replay_LUT, new_replay_getLUT)
+        return True
+
+    except Exception as e:
+        return False
+
+
+def replayName_to_replay_file_folders(replayName):
+    replay_file_parent_folder = Configs().get("replay_parent_folder")
+    replay_file_dirs = []
+    for dir in os.listdir(replay_file_parent_folder):
+        if replayName in dir:
+            replay_file_dirs.append("{}/{}/".format(replay_file_parent_folder, dir))
+
+    return replay_file_dirs
+
+
+def load_server_replay(folder, Qs, LUT, getLUT, allUDPservers, udpSenderCounts, serialize='pickle'):
+    if folder == '':
+        return
+
+    pickle_file = ""
+    for file in os.listdir(folder):
+        if file.endswith(('_server_all.' + serialize)):
+            pickle_file = os.path.abspath(folder) + '/' + file
+            break
+
+    if not pickle_file:
+        return
+
+    with open(pickle_file, 'br') as server_pickle:
+        Q, tmpLUT, tmpgetLUT, udpServers, tcpServerPorts, replayName = pickle.load(server_pickle)
+
+    LOG_ACTION(logger, 'Loading for: ' + folder, pickle_file, indent=1, action=False)
+
+    Qs['tcp'][replayName] = Q['tcp']
+    Qs['udp'][replayName] = Q['udp']
+
+    LUT[replayName] = tmpLUT
+    getLUT[replayName] = tmpgetLUT
+
+    # Calculating udpSenderCounts
+    udpSenderCounts[replayName] = len(Q['udp'])
+
+    # Adding to server list
+    for serverIP in udpServers:
+        if serverIP not in allUDPservers:
+            allUDPservers[serverIP] = set()
+        for serverPort in udpServers[serverIP]:
+            allUDPservers[serverIP].add(serverPort)
+
+    # Merging Q if original_ips is off
+    if not Configs().get('original_ips'):
+        Qs['udp'][replayName], udpSenderCounts[replayName] = merge_servers(Q['udp'])
+
+
+def update_Qs(finalLUT, finalgetLUT, allIPs, tcpIPs, Qs, LUT, getLUT):
+    for replayName in Qs['tcp']:
+        for csp in Qs['tcp'][replayName]:
+            sss = csp.partition('-')[2]
+            ip = sss.rpartition('.')[0]
+            port = sss.rpartition('.')[2]
+
+            if ip not in tcpIPs:
+                tcpIPs[ip] = set()
+            if port not in tcpIPs[ip]:
+                tcpIPs[ip].add(port)
+
+    for protocol in Qs:
+        for replayName in Qs[protocol]:
+            for csp in Qs[protocol][replayName]:
+                add_IP = csp.partition('-')[2].rpartition('.')[0]
+                if add_IP not in allIPs:
+                    allIPs.add(csp.partition('-')[2].rpartition('.')[0])
+
+    for replayName in LUT:
+        for protocol in LUT[replayName]:
+            if protocol not in finalLUT:
+                finalLUT[protocol] = {}
+            for x in LUT[replayName][protocol]:
+                if x not in finalLUT[protocol]:
+                    finalLUT[protocol][x] = LUT[replayName][protocol][x]
+
+    for replayName in getLUT:
+        for csp in getLUT[replayName]:
+            if csp not in finalgetLUT:
+                finalgetLUT[csp] = getLUT[replayName][csp]
+
+    return finalLUT, finalgetLUT, tcpIPs, allIPs
+
+
+def load_Qs():
     '''
     This loads and de-serializes all necessary objects.
     
@@ -1578,14 +1764,16 @@ def load_Qs(serialize='pickle'):
           So we need to decode them before starting the replay.
     '''
     Qs = {'tcp': {}, 'udp': {}}
-    folders = []
-    allUDPservers = {}
-    udpSenderCounts = {}
     LUT = {}
     getLUT = {}
-    tcpPorts = set()
+    allUDPservers = {}
+    udpSenderCounts = {}
+    finalLUT = {}
+    finalgetLUT = {}
     allIPs = set()
+    tcpIPs = {}
 
+    folders = []
     pcap_folder = Configs().get('pcap_folder')
 
     if os.path.isfile(pcap_folder):
@@ -1596,104 +1784,10 @@ def load_Qs(serialize='pickle'):
         folders.append(pcap_folder)
 
     for folder in folders:
-        if folder == '':
-            continue
+        load_server_replay(folder, Qs, LUT, getLUT, allUDPservers, udpSenderCounts, serialize='pickle')
+        update_Qs(finalLUT, finalgetLUT, allIPs, tcpIPs, Qs, LUT, getLUT)
 
-        for file in os.listdir(folder):
-            if file.endswith(('_server_all.' + serialize)):
-                pickle_file = os.path.abspath(folder) + '/' + file
-                break
-
-        if serialize == 'pickle':
-            Q, tmpLUT, tmpgetLUT, udpServers, tcpServerPorts, replayName = pickle.load(open(pickle_file, 'br'))
-
-        elif serialize == 'json':
-            print('\n\nJSON NOT SUPPORTED YET!\n\n')
-            sys.exit(-1)
-
-        LOG_ACTION(logger, 'Loading for: ' + replayName, indent=1, action=False)
-
-        # Decode all payloads
-        for csp in Q['udp']:
-            for p in Q['udp'][csp]:
-                p.payload = p.payload
-        for csp in Q['tcp']:
-            for response_set in Q['tcp'][csp]:
-                for one_response in response_set.response_list:
-                    one_response.payload = one_response.payload
-
-        Qs['tcp'][replayName] = Q['tcp']
-        Qs['udp'][replayName] = Q['udp']
-
-        LUT[replayName] = tmpLUT
-        getLUT[replayName] = tmpgetLUT
-
-        # Calculating udpSenderCounts
-        udpSenderCounts[replayName] = len(Q['udp'])
-
-        # Adding to server list
-        for serverIP in udpServers:
-            if serverIP not in allUDPservers:
-                allUDPservers[serverIP] = set()
-            for serverPort in udpServers[serverIP]:
-                allUDPservers[serverIP].add(serverPort)
-
-        # Merging Q if original_ips is off
-        if not Configs().get('original_ips'):
-            Qs['udp'][replayName], udpSenderCounts[replayName] = merge_servers(Q['udp'])
-
-        for port in tcpServerPorts:
-            tcpPorts.add(port)
-
-    # Creating tcpIPs
-    tcpIPs = {}
-    for replayName in Qs['tcp']:
-        for csp in Qs['tcp'][replayName]:
-            sss = csp.partition('-')[2]
-            ip = sss.rpartition('.')[0]
-            port = sss.rpartition('.')[2]
-
-            if ip not in tcpIPs:
-                tcpIPs[ip] = set()
-            tcpIPs[ip].add(port)
-
-    for protocol in Qs:
-        for replayName in Qs[protocol]:
-            for csp in Qs[protocol][replayName]:
-                allIPs.add(csp.partition('-')[2].rpartition('.')[0])
-
-    finalLUT = {'tcp': {}, 'udp': {}}
-    c = 0
-    for replayName in LUT:
-        for protocol in LUT[replayName]:
-            for x in LUT[replayName][protocol]:
-                c += 1
-                try:
-                    finalLUT[protocol][x]
-                    print('DUP in finalLUT', protocol, x, finalLUT[protocol][x], LUT[replayName][protocol][x])
-                except:
-                    pass
-                finally:
-                    finalLUT[protocol][x] = LUT[replayName][protocol][x]
-
-    print(c, len(finalLUT['tcp']) + len(finalLUT['udp']))
-
-    finalgetLUT = {}
-    c = 0
-    for replayName in getLUT:
-        for csp in getLUT[replayName]:
-            c += 1
-            try:
-                finalgetLUT[csp]
-                print('DUP in finalgetLUT', csp)
-            except:
-                pass
-            finally:
-                finalgetLUT[csp] = getLUT[replayName][csp]
-
-    print(c, len(finalgetLUT))
-
-    return Qs, finalLUT, finalgetLUT, allUDPservers, udpSenderCounts, tcpIPs, tcpPorts, allIPs
+    return Qs, finalLUT, finalgetLUT, allUDPservers, udpSenderCounts, tcpIPs, allIPs
 
 
 def atExit(aliases, iperf):
@@ -1717,7 +1811,7 @@ def run(*args):
     
     mappings:  Hold udpServers' client mapping and passed to SideChannel for cleaning
     '''
-
+    tracemalloc.start()
     PRINT_ACTION('Reading configs and args', 0)
     configs = Configs()
     configs.set('sidechannel_port', 55555)
@@ -1784,7 +1878,7 @@ def run(*args):
         iperf = None
 
     LOG_ACTION(logger, 'Loading server queues')
-    Qs, LUT, getLUT, udpServers, udpSenderCounts, tcpIPs, tcpPorts, allIPs = load_Qs(serialize=configs.get('serialize'))
+    Qs, LUT, getLUT, udpServers, udpSenderCounts, tcpIPs, allIPs = load_Qs()
 
     LOG_ACTION(logger, 'IP aliasing')
     alias_c = 1
@@ -1798,7 +1892,8 @@ def run(*args):
     atexit.register(atExit, aliases=aliases, iperf=iperf)
 
     LOG_ACTION(logger, 'Creating and running the side channel')
-    side_channel = SideChannel((configs.get('publicIP'), configs.get('sidechannel_port')), udpSenderCounts, notify_q,
+    side_channel = SideChannel((configs.get('publicIP'), configs.get('sidechannel_port')), Qs, LUT, getLUT, udpServers,
+                               udpSenderCounts, notify_q,
                                greenlets_q, ports_q, logger_q, errorlog_q)
 
     LOG_ACTION(logger, 'Creating and running UDP servers')
