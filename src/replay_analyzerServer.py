@@ -498,23 +498,22 @@ def processResult(results):
 
 # 1. Analyze using the throughputs sent by client (server creates a client decision file for the GET handle to answer client request)
 # 2. Use the tcpdump trace to perform server side analysis (if tcpdump enabled)
-def analyzer(userID, historyCount, testID, xputBuckets, alpha):
+def analyzer(userID, historyCount, testID, alpha):
     resultsFolder = Configs().get('tmpResultsFolder')
     LOG_ACTION(logger, 'analyzer:{}, {}, {}'.format(userID, historyCount, testID))
 
     # return value is None if there is no file to analyze
 
     resObjClient = FA.finalAnalyzer(userID, historyCount, testID, resultsFolder,
-                                    xputBuckets, alpha)
+                                    alpha)
 
 
 def jobDispatcher(q):
-    xputBuckets = Configs().get('xputBuckets')
     alpha = Configs().get('alpha')
     pool = gevent.pool.Pool()
     while True:
         userID, historyCount, testID = q.get()
-        pool.apply_async(analyzer, args=(userID, historyCount, testID, xputBuckets, alpha,))
+        pool.apply_async(analyzer, args=(userID, historyCount, testID, alpha,))
 
 
 class myJsonEncoder(json.JSONEncoder):
@@ -526,7 +525,7 @@ class myJsonEncoder(json.JSONEncoder):
         return obj
 
 
-def loadAndReturnResult(userID, historyCount, testID, args):
+def loadAndReturnResult(userID, historyCount, testID):
     resultsFolder = Configs().get('tmpResultsFolder')
 
     resultFile = (resultsFolder + userID + '/decisions/' + 'results_{}_{}_{}_{}.json').format(userID, 'Client',
@@ -546,10 +545,20 @@ def loadAndReturnResult(userID, historyCount, testID, args):
                                                                                                       0)
     # if result file is here, return result
     if os.path.isfile(resultFile) and os.path.isfile(replayInfoFile):
-        results = json.load(open(resultFile, 'r'))
-        info = json.load(open(replayInfoFile, 'r'))
+        try:
+            with open(resultFile, 'r') as readFile:
+                results = json.load(readFile)
+            with open(replayInfoFile, 'r') as readFile:
+                info = json.load(readFile)
+        except: # failed at loading the result file, re-running analyzer
+            alpha = Configs().get('alpha')
+            resultsFolder = Configs().get('tmpResultsFolder')
+            FA.finalAnalyzer(userID, historyCount, testID, resultsFolder, alpha)
+            with open(resultFile, 'r') as readFile:
+                results = json.load(readFile)
+            with open(replayInfoFile, 'r') as readFile:
+                info = json.load(readFile)
 
-        realID = info[2]
         replayName = info[4]
         extraString = info[5]
         incomingTime = info[0]
@@ -569,7 +578,6 @@ def loadAndReturnResult(userID, historyCount, testID, args):
         for folder in [permResultsFolder, permDecisionFolder, permClientXputFolder, permReplayInfoFolder]:
             if not os.path.exists(folder):
                 os.mkdir(folder)
-
         mv_decisions = "mv {} {}".format(resultFile, permDecisionFolder)
         mv_replayInfos = "mv {} {} {}".format(replayInfoFile, originalReplayInfoFile, permReplayInfoFolder)
         mv_clientXputs = "mv {} {} {}".format(clientXputFile, clientOriginalXputFile, permClientXputFolder)
@@ -578,11 +586,12 @@ def loadAndReturnResult(userID, historyCount, testID, args):
             p = subprocess.check_output(command, shell=True)
 
         return json.dumps({'success': True,
-                           'response': {'replayName': replayName, 'date': incomingTime, 'userID': userID,
+                            'response': {'replayName': replayName, 'date': incomingTime, 'userID': userID,
                                         'extraString': extraString, 'historyCount': str(historyCount),
                                         'testID': str(testID), 'area_test': areaTest, 'ks2_ratio_test': ks2ratio,
                                         'xput_avg_original': xputAvg1, 'xput_avg_test': xputAvg2,
                                         'ks2dVal': ks2dVal, 'ks2pVal': ks2pVal}}, cls=myJsonEncoder)
+
     else:
         # else if the clientXputs and replayInfo files (but not the result file) exist
         # maybe the POST request is missing, try putting the test to the analyzer queue
@@ -591,7 +600,7 @@ def loadAndReturnResult(userID, historyCount, testID, args):
             LOG_ACTION(logger,
                        'result not ready yet, putting into POSTq :{}, {}, {}'.format(userID, historyCount, testID))
             POSTq.put((userID, historyCount, testID))
-        return json.dumps({'success': False, 'error': 'No result found'})
+            return json.dumps({'success': False, 'error': 'No result found'})
 
 
 def getHandler(args):
@@ -622,8 +631,8 @@ def getHandler(args):
     RESULT_REQUEST.labels(command).inc()
     if command == 'defaultSetting':
         # Default setting for the client
-        areaThreshold = 0.1
-        ks2Threshold = 0.05
+        areaThreshold = 0.5
+        ks2Threshold = 0.01
         ks2Ratio = 0.95
         return json.dumps({'success': True, 'areaThreshold': str(areaThreshold), 'ks2Threshold': str(ks2Threshold),
                            'ks2Ratio': str(ks2Ratio)}, cls=myJsonEncoder)
@@ -635,7 +644,7 @@ def getHandler(args):
         except Exception as e:
             return json.dumps({'success': False, 'error': str(e)})
 
-        return loadAndReturnResult(userID, historyCount, testID, args)
+        return loadAndReturnResult(userID, historyCount, testID)
 
     # Return the DPI rule
     elif command == 'DPIrule':

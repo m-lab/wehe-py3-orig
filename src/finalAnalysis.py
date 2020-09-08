@@ -62,7 +62,7 @@ class ResultObj(object):
         return dTuple
 
 
-def finalAnalyzer(userID, historyCount, testID, path, xputBuckets, alpha, side="Client"):
+def finalAnalyzer(userID, historyCount, testID, path, alpha, side="Client"):
     replayInfodir = path + '/' + userID + '/replayInfo/'
     regexOriginal = '*_' + str(historyCount) + '_' + str(0) + '.json'
     regexTest = '*_' + str(historyCount) + '_' + str(testID) + '.json'
@@ -95,8 +95,8 @@ def finalAnalyzer(userID, historyCount, testID, path, xputBuckets, alpha, side="
     try:
         resultFile = (path + '/' + userID + '/decisions/' + 'results_{}_{}_{}_{}.json').format(userID, side,
                                                                                                historyCount, testID)
-        xputO = [x for x in xputO if x > 0]
-        xputR = [x for x in xputR if x > 0]
+        # xputO = [x for x in xputO if x > 0]
+        # xputR = [x for x in xputR if x > 0]
         # Only use none-zero throughputs for test
         forPlot, results = testIt(xputO, xputR, resultFile, alpha)
     except Exception as e:
@@ -133,11 +133,9 @@ def plotCDFs(xLists, outfile):
 def testIt(xputO, xputR, resultFile, alpha):
     forPlot = {}
 
-    if os.path.isfile(resultFile):
-        results = json.load(open(resultFile, 'r'))
-    else:
-        results = TH.doTests(xputO, xputR, alpha)
-        json.dump(results, open(resultFile, 'w'))
+    results = TH.doTests(xputO, xputR, alpha)
+    with open(resultFile, "w") as writeFile:
+        json.dump(results, writeFile)
 
     forPlot['Original'] = xputO
     forPlot['Control'] = xputR
